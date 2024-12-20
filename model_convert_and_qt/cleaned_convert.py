@@ -48,7 +48,6 @@ def prune_model(model,args):
             example_inputs,
             importance=imp,
             pruning_ratio=0.5, # remove 50% channels, ResNet18 = {64, 128, 256, 512} => ResNet18_Half = {32, 64, 128, 256}
-            # pruning_ratio_dict = {model.conv1: 0.2, model.layer2: 0.8}, # customized pruning ratios for layers or blocks
             ignored_layers=ignored_layers,
             round_to=8, # It's recommended to round dims/channels to 4x or 8x for acceleration. Please see: https://docs.nvidia.com/deeplearning/performance/dl-performance-convolutional/index.html
         )
@@ -58,7 +57,6 @@ def prune_model(model,args):
         pruner.step()
         macs, nparams = tp.utils.count_ops_and_params(model, example_inputs)
         print(f"MACs: {base_macs/1e9} G -> {macs/1e9} G, #Params: {base_nparams/1e6} M -> {nparams/1e6} M")
-        print(id(model))
     elif args.prune_method == 'test_prune':
         group = dep_graph.get_pruning_group(model.conv1,tp.prune_conv_out_channels,idxs=[0,1,2,3,4,5])
 
@@ -195,6 +193,21 @@ def compare_onnx_torch(onnx_filename, model, x_values):
     print("Exported model has been tested with ONNXRuntime, and the result looks good!")
 
 
+def evaluate_model(model, x_test, y_test):
+    '''##Evaluate the model'''
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for i in range(len(x_test)):
+            x_test_now = x_test[i].reshape(1, 1, 28, 28)
+            output = model(torch.tensor(x_test_now))
+            correct += (torch.argmax(output) == y_test[i]).item()
+            total += 1
+    accuracy = correct / total
+    print(f'Accuracy: {accuracy * 100:.2f}%')
+    
+    return accuracy
 
 def main(args):
     model = Model()
@@ -211,31 +224,23 @@ def main(args):
     if args.prune:
         prune_results = prune_model(model,args)
         pruned_model = copy.deepcopy(model)
+        
     convert_model_to_onnx_mnist(model, onnx_filename)
     compare_onnx_torch(onnx_filename, model, np.random.rand(1, 1, 28, 28).astype(np.float32))
     convert_onnx_to_tf(onnx_filename, tf_filename)
     convert_tf_to_tflite(tf_filename, tflite_filename)
+    
     x_test, y_test = x_test.astype(np.float32), y_test.astype(np.float32)
+    
     last_output = get_tflm_prediction(tflite_filename, x_test)
     acc = np.mean(np.argmax(last_output, axis=1) == y_test)
     
     base_model = Model()
     base_model.load_state_dict(torch.load('mnist_cnn.pth'))
-    base_model.eval()
-    base_acc = 0
-    with torch.no_grad():
-        for i in range(len(x_test)):
-            x_test_now = x_test[i].reshape(1, 1, 28, 28)
-            output = base_model(torch.tensor(x_test_now))
-            base_acc += (torch.argmax(output) == y_test[i]).item()
+    base_acc = evaluate_model(base_model, x_test, y_test)
     
     pruned_model.eval()
-    pruned_acc = 0
-    with torch.no_grad():
-        for i in range(len(x_test)):
-            x_test_now = x_test[i].reshape(1, 1, 28, 28)
-            output = pruned_model(torch.tensor(x_test_now))
-            pruned_acc += (torch.argmax(output) == y_test[i]).item()
+    pruned_acc = evaluate_model(pruned_model, x_test, y_test)
         
     print(f'Before Prune Base Model Accuracy: {base_acc / len(x_test) * 100:.4f}%')
     print(f'After Prune Base Model Accuracy: {pruned_acc / len(x_test) * 100:.4f}%')
